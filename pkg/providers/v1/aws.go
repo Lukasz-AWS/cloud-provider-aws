@@ -1371,7 +1371,7 @@ func newAWSCloud(cfg CloudConfig, awsServices Services) (*Cloud, error) {
 		klog.Warningf("Strict AWS zone checking is disabled.  Proceeding with zone: %s", zone)
 	}
 
-	ec2, err := awsServices.Compute(regionName)
+	ec2Client, err := awsServices.Compute(regionName)
 	if err != nil {
 		return nil, fmt.Errorf("error creating AWS EC2 client: %v", err)
 	}
@@ -1397,7 +1397,7 @@ func newAWSCloud(cfg CloudConfig, awsServices Services) (*Cloud, error) {
 	}
 
 	awsCloud := &Cloud{
-		ec2:      ec2,
+		ec2:      ec2Client,
 		elb:      elb,
 		elbv2:    elbv2,
 		asg:      asg,
@@ -1408,8 +1408,22 @@ func newAWSCloud(cfg CloudConfig, awsServices Services) (*Cloud, error) {
 
 		attaching:        make(map[types.NodeName]map[mountDevice]EBSVolumeID),
 		deviceAllocators: make(map[types.NodeName]DeviceAllocator),
+
+		instanceCache: instanceCache{
+			ec2RequestsChannel: make(chan string, maxEC2ChannelSize),
+			ec2Requests: ec2Requests{
+				set:  make(map[string]bool),
+				lock: sync.RWMutex{},
+			},
+			ec2PrivateCache: ec2PrivateCache{
+				cache: make(map[string]*ec2.Instance),
+				lock:  sync.RWMutex{},
+			},
+		},
 	}
 	awsCloud.instanceCache.cloud = awsCloud
+	//start up ec2 batch processor
+	go awsCloud.instanceCache.StartEc2DescribeBatchProcessing(ec2Client)
 
 	tagged := cfg.Global.KubernetesClusterTag != "" || cfg.Global.KubernetesClusterID != ""
 	if cfg.Global.VPC != "" && (cfg.Global.SubnetID != "" || cfg.Global.RoleARN != "") && tagged {
@@ -1671,7 +1685,7 @@ func (c *Cloud) NodeAddressesByProviderID(ctx context.Context, providerID string
 		return getNodeAddressesForFargateNode(aws.StringValue(eni.PrivateDnsName), aws.StringValue(eni.PrivateIpAddress)), nil
 	}
 
-	instance, err := describeInstance(c.ec2, instanceID)
+	instance, err := c.instanceCache.DescribeInstance(c.ec2, providerID)
 	if err != nil {
 		return nil, err
 	}

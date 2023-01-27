@@ -52,6 +52,33 @@ func (i InstanceID) awsString() *string {
 //   - <awsInstanceId>
 type KubernetesInstanceID string
 
+// EC2 describe instance caching and batching options
+const (
+	// max limit of k8s nodes support
+	maxEC2ChannelSize = 8000
+	// max number of in flight non batched ec2:DescribeInstances request to flow
+	maxAllowedInflightRequest = 3
+	// default wait interval for the ec2 instance id request which is already in flight
+	defaultWaitInterval = 50 * time.Millisecond
+	// Making sure the single instance calls waits max till 5 seconds 100* (50 * time.Millisecond)
+	totalIterationForWaitInterval = 100
+	// Maximum number of instances with which ec2:DescribeInstances call will be made
+	maxInstancesBatchSize = 100
+	// Maximum time in Milliseconds to wait for a new batch call this also depends on if the instance size has
+	// already become 100 then it will not respect this limit
+	maxWaitIntervalForBatch = 1000
+)
+
+type ec2Requests struct {
+	set  map[string]bool
+	lock sync.RWMutex
+}
+
+type ec2PrivateCache struct {
+	cache map[string]*ec2.Instance
+	lock  sync.RWMutex
+}
+
 // MapToAWSInstanceID extracts the InstanceID from the KubernetesInstanceID
 func (name KubernetesInstanceID) MapToAWSInstanceID() (InstanceID, error) {
 	s := string(name)
@@ -147,6 +174,145 @@ type instanceCache struct {
 
 	mutex    sync.Mutex
 	snapshot *allInstancesSnapshot
+
+	ec2Requests        ec2Requests
+	ec2PrivateCache    ec2PrivateCache
+	ec2RequestsChannel chan string
+}
+
+func (c *instanceCache) setec2PrivateCache(id string, ec2Instance *ec2.Instance) {
+	c.ec2PrivateCache.lock.Lock()
+	defer c.ec2PrivateCache.lock.Unlock()
+	c.ec2PrivateCache.cache[id] = ec2Instance
+}
+
+func (c *instanceCache) getec2PrivateCache(id string) (*ec2.Instance, error) {
+	c.ec2PrivateCache.lock.RLock()
+	defer c.ec2PrivateCache.lock.RUnlock()
+	if ec2Instance, ok := c.ec2PrivateCache.cache[id]; ok {
+		return ec2Instance, nil
+	}
+	return nil, fmt.Errorf("instance id not found")
+}
+
+func (c *instanceCache) setec2RequestInFlight(id string) {
+	c.ec2Requests.lock.Lock()
+	defer c.ec2Requests.lock.Unlock()
+	c.ec2Requests.set[id] = true
+}
+
+func (c *instanceCache) unsetec2RequestInFlight(id string) {
+	c.ec2Requests.lock.Lock()
+	defer c.ec2Requests.lock.Unlock()
+	delete(c.ec2Requests.set, id)
+}
+
+func (c *instanceCache) getec2RequestInFlight(id string) bool {
+	c.ec2Requests.lock.RLock()
+	defer c.ec2Requests.lock.RUnlock()
+	_, ok := c.ec2Requests.set[id]
+	return ok
+}
+
+func (c *instanceCache) getec2RequestsInFlightSize() int {
+	c.ec2Requests.lock.RLock()
+	defer c.ec2Requests.lock.RUnlock()
+	return len(c.ec2Requests.set)
+}
+
+// Calls ec2 API if not in cache
+func (c *instanceCache) DescribeInstance(ec2Client EC2, id string) (*ec2.Instance, error) {
+	instance, err := c.getec2PrivateCache(id)
+	if err == nil {
+		return instance, nil
+	}
+	klog.V(4).Infof("Missed the ec2PrivateCache for the InstanceId = %s Verifying if its already in ec2RequestsQueue ", id)
+	// check if the request for instanceId already in queue.
+	if c.getec2RequestInFlight(id) {
+		klog.Infof("Found the InstanceId:= %s request In Queue waiting in 5 seconds loop ", id)
+		for i := 0; i < totalIterationForWaitInterval; i++ {
+			time.Sleep(defaultWaitInterval)
+			instance, err := c.getec2PrivateCache(id)
+			if err == nil {
+				return instance, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to find node %s in ec2PrivateCache returning from loop", id)
+	}
+
+	klog.Infof("Missed the ec2RequestsQueue cache for the InstanceId = %s", id)
+	c.setec2RequestInFlight(id)
+	requestQueueLength := c.getec2RequestsInFlightSize()
+	//The code verifies if the ec2Requests size is greater than max request in flight
+	// then it writes to the channel where we are making batch ec2:DescribeInstances API call.
+	if requestQueueLength > maxAllowedInflightRequest {
+		klog.Infof("Writing to buffered channel for instance Id %s ", id)
+		c.ec2RequestsChannel <- id
+		return c.DescribeInstance(ec2Client, id)
+	}
+
+	klog.Infof("Calling ec2:DescribeInstances for the InstanceId = %s ", id)
+	// Look up instance from EC2 API
+	instance, err = describeInstance(ec2Client, InstanceID(id))
+	if err != nil {
+		c.unsetec2RequestInFlight(id)
+		return nil, fmt.Errorf("failed querying EC2 API for node %s: %s ", id, err.Error())
+	}
+	c.setec2PrivateCache(id, instance)
+	c.unsetec2RequestInFlight(id)
+
+	return instance, nil
+}
+
+func (c *instanceCache) StartEc2DescribeBatchProcessing(ec2Client EC2) {
+	startTime := time.Now()
+	var instanceIdList []string
+	for {
+		var instanceId string
+		select {
+		case instanceId = <-c.ec2RequestsChannel:
+			klog.V(4).Infof("Received the Instance Id := %s from buffered Channel for batch processing ", instanceId)
+			instanceIdList = append(instanceIdList, instanceId)
+		default:
+			// Waiting for more elements to get added to the buffered Channel
+			// And to support the for select loop.
+			time.Sleep(20 * time.Millisecond)
+		}
+		endTime := time.Now()
+		/*
+		   The if statement checks for empty list and ignores to make any ec2:Describe API call
+		   If elements are less than 100 and time of 200 millisecond has elapsed it will make the
+		   ec2:DescribeInstances call with as many elements in the list.
+		*/
+		if (len(instanceIdList) > 0 && (endTime.Sub(startTime).Milliseconds()) > maxWaitIntervalForBatch) || len(instanceIdList) > maxInstancesBatchSize {
+			startTime = time.Now()
+			dupInstanceList := make([]string, len(instanceIdList))
+			copy(dupInstanceList, instanceIdList)
+			go c.getEC2InstancesAndPublishToCache(ec2Client, dupInstanceList)
+			instanceIdList = nil
+		}
+	}
+}
+func (c *instanceCache) getEC2InstancesAndPublishToCache(ec2Client EC2, instanceIdList []string) {
+	// Look up instance from EC2 API
+	klog.Infof("Making Batch Query to DescribeInstances for %v instances ", len(instanceIdList))
+	output, err := ec2Client.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: aws.StringSlice(instanceIdList),
+	})
+	if err != nil {
+		klog.Errorf("Batch call failed querying from EC2 API for nodes [%s] : with error = []%s ", instanceIdList, err.Error())
+	} else {
+		// Adding the result to ec2PrivateCache as well as removing from the requestQueueMap.
+		for _, instance := range output {
+			id := aws.StringValue(instance.InstanceId)
+			c.setec2PrivateCache(id, instance)
+		}
+	}
+
+	klog.V(4).Infof("Removing instances from request Queue after getting response from Ec2")
+	for _, id := range instanceIdList {
+		c.unsetec2RequestInFlight(id)
+	}
 }
 
 // Gets the full information about these instance from the EC2 API. Caller must have acquired c.mutex before
